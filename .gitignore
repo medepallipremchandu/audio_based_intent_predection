@@ -1,1 +1,19 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyd
+
+# Virtual env
+venv/
+
+# Environment variables
 .env
+
+# IDE
+.idea/
+
+# Logs
+logs/
+
+# Uploads (optional if temporary files)
+uploads/

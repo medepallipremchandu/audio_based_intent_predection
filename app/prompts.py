@@ -18,6 +18,7 @@ deadline_interest
 intent
 confidence_score
 interest_level
+enrollment_probability
 reasons
 objections
 summary
