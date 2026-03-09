@@ -6,4 +6,3 @@ openai
 pydantic
 joblib
 numpy
-xgboost

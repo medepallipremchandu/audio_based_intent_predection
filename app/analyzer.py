@@ -44,15 +44,19 @@ def analyze_call(audio_path: str) -> dict:
             v = value.strip()
             return [v] if v else []
         return []
+    # Extract features from GPT analysis
+    # GPT returns a "features" object with counts, plus separate lists
+    gpt_features = analysis.get("features", {})
+    
     llm_features = {
-        "student_questions_count": to_int(analysis.get("student_questions_count", 0)),
-        "student_objections_count": to_int(analysis.get("student_objections_count", 0)),
-        "positive_statements": to_int(analysis.get("positive_statements", 0)),
-        "negative_statements": to_int(analysis.get("negative_statements", 0)),
-        "budget_mentions": to_int(analysis.get("budget_mentions", 0)),
-        "parent_mentions": to_int(analysis.get("parent_mentions", 0)),
-        "course_mentions": to_int(analysis.get("course_mentions", 0)),
-        "deadline_interest": int(bool(analysis.get("deadline_interest", 0)))
+        "student_questions_count": to_int(gpt_features.get("student_questions_count", 0)),
+        "student_objections_count": to_int(gpt_features.get("student_objections_count", 0)),
+        "positive_statements": to_int(gpt_features.get("positive_statements", 0)),
+        "negative_statements": to_int(gpt_features.get("negative_statements", 0)),
+        "budget_mentions": to_int(gpt_features.get("budget_mentions", 0)),
+        "parent_mentions": to_int(gpt_features.get("parent_mentions", 0)),
+        "course_mentions": to_int(gpt_features.get("course_mentions", 0)),
+        "deadline_interest": int(bool(gpt_features.get("deadline_interest", 0)))
     }
     llm_enrollment_probability = to_float(analysis.get("enrollment_probability", 0))
     ml_enrollment_probability = predict_enrollment(llm_features)
