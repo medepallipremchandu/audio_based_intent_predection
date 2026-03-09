@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import uuid, os, shutil, logging
 from fastapi.responses import JSONResponse
+
 from app.analyzer import analyze_call
 
 app = FastAPI(title="University Admission Call AI")
@@ -20,29 +21,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploads"
+# Use /tmp for serverless environment
+UPLOAD_DIR = "/tmp/uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+
+# Configure logging for serverless
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 logger = logging.getLogger("admission_call_ai")
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    ch = logging.StreamHandler()
-    fh = logging.FileHandler(os.path.join(LOG_DIR, "app.log"))
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    ch.setFormatter(formatter)
-    fh.setFormatter(formatter)
-    logger.addHandler(ch)
-    logger.addHandler(fh)
+
+@app.get("/")
+async def root():
+    return {
+        "message": "VoxIntent AI - Audio Analysis API",
+        "status": "running",
+        "endpoints": {
+            "analyze": "/analyze-call",
+            "docs": "/docs"
+        }
+    }
 
 @app.post("/analyze-call")
 async def analyze(file: UploadFile = File(...)):
     file_id = str(uuid.uuid4())
     path = f"{UPLOAD_DIR}/{file_id}_{file.filename}"
-    with open(path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
+    
     try:
+        # Save uploaded file
+        with open(path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
         logger.info(f"analyze_call start request_id={file_id} filename={file.filename}")
         result = analyze_call(path)
         logger.info(f"analyze_call success request_id={file_id}")
@@ -57,6 +67,7 @@ async def analyze(file: UploadFile = File(...)):
             },
         )
     finally:
+        # Cleanup uploaded file
         try:
             if os.path.exists(path):
                 os.remove(path)

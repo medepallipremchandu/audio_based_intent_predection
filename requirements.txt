@@ -1,24 +1,9 @@
-# Production Requirements (Lightweight for Deployment)
-# Only includes runtime dependencies, not training libraries
-
-# Core API Framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-python-multipart==0.0.6
-
-# Configuration
-python-dotenv==1.0.0
-
-# Azure OpenAI
-openai==1.10.0
-
-# Data Validation
-pydantic==2.5.3
-
-# ML Model Loading (lightweight)
-joblib==1.3.2
-numpy==1.26.3
-
-# Note: xgboost, pandas, and pyttsx3 are NOT needed for production
-# The model is already trained and saved as .pkl file
-# For training/development, use: pip install -r requirements-dev.txt
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+openai
+pydantic
+joblib
+numpy
+xgboost

@@ -1,17 +1,8 @@
-# Development Requirements (For Training & Testing)
-# Includes all libraries needed for model training
-
-# Include production requirements
 -r requirements-production.txt
 
-# ML Training Libraries (Heavy - only for development)
 xgboost==2.0.3
 pandas==2.1.4
-
-# Text-to-Speech (Optional - for testing)
 pyttsx3==2.90
-
-# Additional Development Tools
 scikit-learn==1.4.0
 numpy==1.26.3
 matplotlib==3.8.2
