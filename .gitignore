@@ -17,3 +17,4 @@ logs/
 
 # Uploads (optional if temporary files)
 uploads/
+.vercel
