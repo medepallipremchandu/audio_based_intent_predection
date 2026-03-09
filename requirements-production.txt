@@ -1,4 +1,4 @@
-# Production Requirements (Lightweight for Deployment)
+# Production Requirements (Lightweight for Vercel/Deployment)
 # Only includes runtime dependencies, not training libraries
 
 # Core API Framework
@@ -21,4 +21,4 @@ numpy==1.26.3
 
 # Note: xgboost, pandas, and pyttsx3 are NOT needed for production
 # The model is already trained and saved as .pkl file
-# For training/development, use: pip install -r requirements-dev.txt
+# These are only needed for training (see requirements-dev.txt)

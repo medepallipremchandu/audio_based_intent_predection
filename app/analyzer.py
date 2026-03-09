@@ -4,8 +4,13 @@ from app.recommendation_engine import generate_recommendations
 from app.ml_model import predict_enrollment
 
 def analyze_call(audio_path: str) -> dict:
-    transcript = transcribe_audio(audio_path)
+    # Transcribe audio (returns dict with text, duration, cost)
+    transcription_result = transcribe_audio(audio_path)
+    transcript = transcription_result["text"]
+    
+    # Analyze transcript (returns dict with analysis and token_usage)
     analysis = analyze_transcript(transcript)
+    
     def to_int(value):
         if isinstance(value, list):
             return len(value)
@@ -55,6 +60,12 @@ def analyze_call(audio_path: str) -> dict:
     rec_ml = generate_recommendations(llm_features, analysis.get("objections", []))
     llm_follow_up = "high" if llm_enrollment_probability > 0.6 else "medium"
     ml_follow_up = "high" if ml_enrollment_probability > 0.6 else "medium"
+    
+    # Calculate total cost
+    whisper_cost = transcription_result["cost_usd"]
+    gpt_cost = analysis.get("token_usage", {}).get("total_cost_usd", 0)
+    total_cost = whisper_cost + gpt_cost
+    
     return {
         "transcript": transcript,
         "llm": {
@@ -79,4 +90,12 @@ def analyze_call(audio_path: str) -> dict:
             "recommendations": rec_ml,
             "follow_up_priority": ml_follow_up,
         },
+        "usage": {
+            "whisper": {
+                "duration_minutes": transcription_result["duration_minutes"],
+                "cost_usd": whisper_cost
+            },
+            "gpt4": analysis.get("token_usage", {}),
+            "total_cost_usd": round(total_cost, 4)
+        }
     }
