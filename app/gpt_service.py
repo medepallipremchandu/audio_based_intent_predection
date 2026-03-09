@@ -3,19 +3,9 @@ from openai import AzureOpenAI
 from app.config import settings
 from app.prompts import FEATURE_PROMPT
 
-client = AzureOpenAI(
-    api_key=settings.AZURE_OPENAI_API_KEY,
-    api_version=settings.AZURE_OPENAI_API_VERSION,
-    azure_endpoint=settings.AZURE_OPENAI_ENDPOINT
-)
+client = AzureOpenAI(api_key=settings.AZURE_OPENAI_API_KEY, api_version=settings.AZURE_OPENAI_API_VERSION, azure_endpoint=settings.AZURE_OPENAI_ENDPOINT)
 
 def analyze_transcript(transcript):
-    """
-    Analyze transcript with GPT-4 and track token usage.
-    GPT-4 pricing (approximate):
-    - Input: $0.03 per 1K tokens
-    - Output: $0.06 per 1K tokens
-    """
     prompt = FEATURE_PROMPT.format(transcript=transcript)
     response = client.chat.completions.create(
         model=settings.AZURE_OPENAI_DEPLOYMENT,
@@ -25,23 +15,15 @@ def analyze_transcript(transcript):
         ],
         temperature=0.2
     )
-    
     content = response.choices[0].message.content
-    
-    # Extract token usage
     usage = response.usage
     prompt_tokens = usage.prompt_tokens
     completion_tokens = usage.completion_tokens
     total_tokens = usage.total_tokens
-    
-    # Calculate cost (GPT-4 pricing)
     input_cost = (prompt_tokens / 1000) * 0.03
     output_cost = (completion_tokens / 1000) * 0.06
     total_cost = input_cost + output_cost
-    
     analysis = json.loads(content)
-    
-    # Add token and cost information
     analysis["token_usage"] = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -50,5 +32,4 @@ def analyze_transcript(transcript):
         "output_cost_usd": round(output_cost, 4),
         "total_cost_usd": round(total_cost, 4)
     }
-    
     return analysis
