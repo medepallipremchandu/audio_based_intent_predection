@@ -4,13 +4,9 @@ from app.recommendation_engine import generate_recommendations
 from app.ml_model import predict_enrollment
 
 def analyze_call(audio_path: str) -> dict:
-    # Transcribe audio (returns dict with text, duration, cost)
     transcription_result = transcribe_audio(audio_path)
     transcript = transcription_result["text"]
-    
-    # Analyze transcript (returns dict with analysis and token_usage)
     analysis = analyze_transcript(transcript)
-    
     def to_int(value):
         if isinstance(value, list):
             return len(value)
@@ -44,19 +40,16 @@ def analyze_call(audio_path: str) -> dict:
             v = value.strip()
             return [v] if v else []
         return []
-    # Extract features from GPT analysis
-    # GPT returns a "features" object with counts, plus separate lists
-    gpt_features = analysis.get("features", {})
-    
+    # Extract features from GPT analysis (features are at root level)
     llm_features = {
-        "student_questions_count": to_int(gpt_features.get("student_questions_count", 0)),
-        "student_objections_count": to_int(gpt_features.get("student_objections_count", 0)),
-        "positive_statements": to_int(gpt_features.get("positive_statements", 0)),
-        "negative_statements": to_int(gpt_features.get("negative_statements", 0)),
-        "budget_mentions": to_int(gpt_features.get("budget_mentions", 0)),
-        "parent_mentions": to_int(gpt_features.get("parent_mentions", 0)),
-        "course_mentions": to_int(gpt_features.get("course_mentions", 0)),
-        "deadline_interest": int(bool(gpt_features.get("deadline_interest", 0)))
+        "student_questions_count": to_int(analysis.get("student_questions_count", 0)),
+        "student_objections_count": to_int(analysis.get("student_objections_count", 0)),
+        "positive_statements": to_int(analysis.get("positive_statements", 0)),
+        "negative_statements": to_int(analysis.get("negative_statements", 0)),
+        "budget_mentions": to_int(analysis.get("budget_mentions", 0)),
+        "parent_mentions": to_int(analysis.get("parent_mentions", 0)),
+        "course_mentions": to_int(analysis.get("course_mentions", 0)),
+        "deadline_interest": int(bool(analysis.get("deadline_interest", 0)))
     }
     llm_enrollment_probability = to_float(analysis.get("enrollment_probability", 0))
     ml_enrollment_probability = predict_enrollment(llm_features)
@@ -64,12 +57,9 @@ def analyze_call(audio_path: str) -> dict:
     rec_ml = generate_recommendations(llm_features, analysis.get("objections", []))
     llm_follow_up = "high" if llm_enrollment_probability > 0.6 else "medium"
     ml_follow_up = "high" if ml_enrollment_probability > 0.6 else "medium"
-    
-    # Calculate total cost
     whisper_cost = transcription_result["cost_usd"]
     gpt_cost = analysis.get("token_usage", {}).get("total_cost_usd", 0)
     total_cost = whisper_cost + gpt_cost
-    
     return {
         "transcript": transcript,
         "llm": {
