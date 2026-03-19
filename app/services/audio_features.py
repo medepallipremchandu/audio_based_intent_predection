@@ -4,6 +4,62 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _kmeans_1d(values: list[float], k: int, iterations: int = 30) -> tuple[list[int], float]:
+    """1-D k-means. Returns (labels, inertia)."""
+    if k <= 1 or not values:
+        return [0] * len(values), 0.0
+    arr = np.array(values, dtype=float)
+    sorted_v = np.sort(arr)
+    indices = np.linspace(0, len(sorted_v) - 1, k, dtype=int)
+    centroids = sorted_v[indices].copy()
+    labels = np.zeros(len(arr), dtype=int)
+    for _ in range(iterations):
+        dists = np.abs(arr[:, None] - centroids[None, :])
+        new_labels = np.argmin(dists, axis=1)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for j in range(k):
+            members = arr[labels == j]
+            if len(members):
+                centroids[j] = members.mean()
+    inertia = float(sum(
+        (arr[i] - centroids[labels[i]]) ** 2 for i in range(len(arr))
+    ))
+    # Re-order so speaker 0 = lowest avg pitch
+    centroid_order = np.argsort(centroids)
+    remap = {old: new for new, old in enumerate(centroid_order)}
+    return [remap[int(l)] for l in labels], inertia
+
+
+def _detect_num_speakers(pitches: list[float], max_speakers: int = 5) -> int:
+    """Elbow method on k-means inertia to find optimal number of speakers."""
+    n = len(pitches)
+    if n < 2:
+        return 1
+    max_k = min(max_speakers, n // 2)  # need at least 2 points per cluster
+    if max_k < 2:
+        return 1
+
+    inertias = []
+    for k in range(1, max_k + 1):
+        _, inertia = _kmeans_1d(pitches, k)
+        inertias.append(inertia)
+
+    if len(inertias) < 2:
+        return 1
+
+    # Elbow: find k where gain drops below 20% of total drop
+    total_drop = inertias[0] - inertias[-1]
+    if total_drop < 1e-6:
+        return 1
+    for k in range(1, len(inertias)):
+        gain = inertias[k - 1] - inertias[k]
+        if gain / total_drop < 0.20:
+            return k  # k speakers (1-indexed position = k)
+    return max_k
+
 SEGMENT_DURATION = 7
 SILENCE_DB = -40
 HOP = 512
@@ -185,6 +241,22 @@ def extract_audio_features(audio_path: str, transcript: str = "") -> dict:
 
     for s in segments:
         s["speech_rate"] = rate
+
+    # --- Speaker diarization via pitch k-means ---
+    voiced_segs = [(i, s) for i, s in enumerate(segments) if s["avg_pitch"] > 0]
+    if len(voiced_segs) >= 2:
+        pitches_voiced = [s["avg_pitch"] for _, s in voiced_segs]
+        num_speakers = _detect_num_speakers(pitches_voiced)
+        labels, _ = _kmeans_1d(pitches_voiced, num_speakers)
+        for (orig_idx, _), label in zip(voiced_segs, labels):
+            segments[orig_idx]["speaker_id"] = label
+    # Unvoiced segments inherit nearest neighbour
+    last_label = 0
+    for s in segments:
+        if "speaker_id" not in s:
+            s["speaker_id"] = last_label
+        else:
+            last_label = s["speaker_id"]
 
     wf = _waveform(y)
 
