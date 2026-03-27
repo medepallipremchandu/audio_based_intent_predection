@@ -536,7 +536,7 @@ def create_feedback(payload: CreateFeedbackRequest, user: User = Depends(require
         priority=priority,
         source_id=payload.source_id,
         department_id=payload.department_id,
-        course_code=payload.course_code,
+        course_code=normalize_course_code(payload.course_code),
         submitted_by=user.id,
         intent=intent,
         sentiment=sentiment,
@@ -591,7 +591,7 @@ def create_public_feedback(payload: CreateFeedbackRequest, db: Session = Depends
         priority=priority,
         source_id=normalized_source_id,
         department_id=payload.department_id,
-        course_code=payload.course_code,
+        course_code=normalize_course_code(payload.course_code),
         submitted_by=anonymous_user.id,
         intent=intent,
         sentiment=sentiment,
@@ -661,7 +661,7 @@ async def create_audio_feedback(
         priority=priority,
         source_id=source_id,
         department_id=department_id,
-        course_code=course_code,
+        course_code=normalize_course_code(course_code),
         submitted_by=user.id,
         intent=intent,
         sentiment=sentiment,
@@ -735,7 +735,7 @@ async def create_public_audio_feedback(
         priority=priority,
         source_id=normalized_source_id,
         department_id=department_id,
-        course_code=course_code,
+        course_code=normalize_course_code(course_code),
         submitted_by=anonymous_user.id,
         intent=intent,
         sentiment=sentiment,
@@ -989,6 +989,16 @@ def serialize_feedback(it: Feedback, permissions: set[str], submitter_names: dic
 def make_title(text: str) -> str:
     clean = " ".join((text or "Feedback").split())
     return clean[:80] if clean else "Feedback"
+
+
+def normalize_course_code(value: str | None) -> str | None:
+    """Normalize and bound course_code to DB-safe length."""
+    if value is None:
+        return None
+    clean = " ".join(str(value).split()).strip()
+    if not clean:
+        return None
+    return clean[:80]
 
 
 def derive_priority(analysis: dict) -> str:

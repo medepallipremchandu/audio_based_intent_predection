@@ -5,6 +5,26 @@ from app.services.gpt import analyze
 
 logger = logging.getLogger(__name__)
 
+AUDIO_FEATURE_DEFAULTS = {
+    "total_duration": 0.0,
+    "speaking_duration": 0.0,
+    "silence_ratio": 0.0,
+    "avg_pitch": 0.0,
+    "pitch_variation": 0.0,
+    "pitch_trend": "stable",
+    "avg_volume": 0.0,
+    "volume_spikes": 0,
+    "speech_rate": 0.0,
+    "pause_count": 0,
+    "avg_pause_duration_sec": 0.0,
+    "tone_label": "neutral",
+    "tone_confidence": 0.5,
+    "segment_count": 0,
+    "segments": [],
+    "waveform_data": [],
+    "waveform_times": [],
+}
+
 
 def _safe_list(v) -> list:
     if isinstance(v, list): return v
@@ -76,9 +96,10 @@ def _override_segment_sentiments(
 
 
 def run_pipeline(audio_path: str) -> dict:
-    audio_features = {}
+    audio_features = dict(AUDIO_FEATURE_DEFAULTS)
     try:
-        audio_features = extract_audio_features(audio_path)
+        extracted = extract_audio_features(audio_path) or {}
+        audio_features = {**AUDIO_FEATURE_DEFAULTS, **extracted}
         logger.info(
             f"audio extracted segments={audio_features.get('segment_count')} "
             f"duration={audio_features.get('total_duration')}s "
@@ -104,24 +125,24 @@ def run_pipeline(audio_path: str) -> dict:
     whisper_cost = transcription["cost_usd"]
     gpt_cost     = token_usage.get("total_cost_usd", 0)
 
-    audio_out = {**audio_features, "segments": [
+    audio_out = {**AUDIO_FEATURE_DEFAULTS, **audio_features, "segments": [
         {
-            "segment_index":    s["segment_index"],
-            "start_sec":        s["start_sec"],
-            "end_sec":          s["end_sec"],
-            "avg_pitch":        s["avg_pitch"],
-            "pitch_variation":  s["pitch_variation"],
-            "pitch_trend":      s["pitch_trend"],
-            "avg_volume":       s["avg_volume"],
-            "volume_spikes":    s["volume_spikes"],
+            "segment_index":    s.get("segment_index", 0),
+            "start_sec":        s.get("start_sec", 0.0),
+            "end_sec":          s.get("end_sec", 0.0),
+            "avg_pitch":        s.get("avg_pitch", 0.0),
+            "pitch_variation":  s.get("pitch_variation", 0.0),
+            "pitch_trend":      s.get("pitch_trend", "stable"),
+            "avg_volume":       s.get("avg_volume", 0.0),
+            "volume_spikes":    s.get("volume_spikes", 0),
             "speech_rate":      s.get("speech_rate", 0.0),
-            "pause_count":      s["pause_count"],
-            "silence_ratio":    s["silence_ratio"],
-            "speaking_duration": s["speaking_duration"],
-            "tone_label":       s["tone_label"],
-            "tone_confidence":  s["tone_confidence"],
+            "pause_count":      s.get("pause_count", 0),
+            "silence_ratio":    s.get("silence_ratio", 0.0),
+            "speaking_duration": s.get("speaking_duration", 0.0),
+            "tone_label":       s.get("tone_label", "neutral"),
+            "tone_confidence":  s.get("tone_confidence", 0.5),
         }
-        for s in segments
+        for s in segments if isinstance(s, dict)
     ]}
 
     raw_speakers = _safe_list(gpt_result.get("speakers", []))
