@@ -22,7 +22,7 @@ INSERT INTO permissions (key, label, tab_key) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 INSERT INTO roles (name, description) VALUES
-('superadmin', 'Full control of roles and permissions'),
+('superadmin', 'Full control of roles and permissions')
 ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO role_permissions (role_id, permission_id)
