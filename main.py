@@ -902,9 +902,10 @@ def dashboard_summary(user: User = Depends(auth_user), db: Session = Depends(get
         "resolve_rate": resolve_rate,
     }
     if "ai.cost.view" in permissions or "system.superadmin" in permissions:
-        response["whisper_cost_usd"] = float(db.scalar(select(func.coalesce(func.sum(Feedback.whisper_cost_usd), 0)).select_from(base.subquery())) or 0)
-        response["gpt_cost_usd"] = float(db.scalar(select(func.coalesce(func.sum(Feedback.gpt_cost_usd), 0)).select_from(base.subquery())) or 0)
-        response["total_ai_cost_usd"] = float(db.scalar(select(func.coalesce(func.sum(Feedback.total_cost_usd), 0)).select_from(base.subquery())) or 0)
+        base_sq = base.subquery()
+        response["whisper_cost_usd"] = float(db.scalar(select(func.coalesce(func.sum(base_sq.c.whisper_cost_usd), 0)).select_from(base_sq)) or 0)
+        response["gpt_cost_usd"] = float(db.scalar(select(func.coalesce(func.sum(base_sq.c.gpt_cost_usd), 0)).select_from(base_sq)) or 0)
+        response["total_ai_cost_usd"] = float(db.scalar(select(func.coalesce(func.sum(base_sq.c.total_cost_usd), 0)).select_from(base_sq)) or 0)
     return response
 
 
