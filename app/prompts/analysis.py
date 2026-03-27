@@ -111,6 +111,11 @@ Each segment = {segment_duration} seconds. Use to detect tone shifts, negativity
       "sentiment_label": "positive|negative|neutral",
       "key_moment": "description or null"
     }}
+    IMPORTANT for sentiment_label:
+    - Mark "negative" if this segment contains any of the negative_statements, has negativity_spike=true, or has disengaged/hostile tone
+    - Mark "positive" if this segment contains any of the positive_statements or has clearly enthusiastic/agreeable tone
+    - Mark "neutral" only if neither positive nor negative signals are present
+    - Do NOT default everything to neutral — actively look for negative and positive segments
   ],
 
   "summary": "2–3 sentences: what happened, emotional arc, key concern or finding"

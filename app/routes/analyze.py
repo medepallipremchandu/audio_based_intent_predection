@@ -20,6 +20,61 @@ def _safe_bool(v) -> bool:
     return False
 
 
+def _override_segment_sentiments(
+    seg_insights: list,
+    negative_statements: list,
+    positive_statements: list,
+    transcript: str,
+) -> list:
+    """
+    GPT often marks all segments neutral even when negative/positive statements exist.
+    We fix this by checking whether any negative or positive statement text appears
+    in the rough transcript window that corresponds to each segment's time range.
+
+    Strategy: split transcript into equal-length chunks matching segment count,
+    then do substring matching against known negative/positive statements.
+    """
+    if not seg_insights or not transcript:
+        return seg_insights
+
+    n = len(seg_insights)
+    words = transcript.split()
+    chunk = max(1, len(words) // n)
+
+    neg_lower = [s.lower().strip() for s in negative_statements if s]
+    pos_lower = [s.lower().strip() for s in positive_statements if s]
+
+    def _contains_any(window_text: str, phrases: list) -> bool:
+        wl = window_text.lower()
+        for phrase in phrases:
+            # match if at least 60% of the phrase words appear in the window
+            phrase_words = phrase.split()
+            if not phrase_words:
+                continue
+            hits = sum(1 for w in phrase_words if w in wl)
+            if hits / len(phrase_words) >= 0.6:
+                return True
+        return False
+
+    result = []
+    for i, si in enumerate(seg_insights):
+        start_w = i * chunk
+        end_w   = min(start_w + chunk, len(words))
+        window  = " ".join(words[start_w:end_w])
+
+        updated = dict(si)
+        if _contains_any(window, neg_lower):
+            updated["sentiment_label"]  = "negative"
+            updated["negativity_spike"] = True
+        elif _contains_any(window, pos_lower):
+            # only upgrade to positive if GPT didn't already flag negative
+            if updated.get("sentiment_label") != "negative":
+                updated["sentiment_label"] = "positive"
+        result.append(updated)
+
+    return result
+
+
 def run_pipeline(audio_path: str) -> dict:
     audio_features = {}
     try:
@@ -82,6 +137,15 @@ def run_pipeline(audio_path: str) -> dict:
     ]
 
     raw_seg_insights = _safe_list(gpt_result.get("segment_insights", []))
+
+    # Fix GPT under-labelling: override segment sentiments using known statements
+    raw_seg_insights = _override_segment_sentiments(
+        raw_seg_insights,
+        negative_statements=_safe_list(gpt_result.get("negative_statements", [])),
+        positive_statements=_safe_list(gpt_result.get("positive_statements", [])),
+        transcript=transcript,
+    )
+
     seg_insights_out = [
         {
             "segment_index":    si.get("segment_index", 0),
