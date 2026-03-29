@@ -1,7 +1,10 @@
 import logging
 from app.services.audio_features import extract_audio_features
+from app.services.linguistics import extract_linguistic_features
 from app.services.whisper import transcribe
 from app.services.gpt import analyze
+
+TOPIC_LEXICON_LABEL = "standard"
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,71 @@ def _safe_bool(v) -> bool:
     if isinstance(v, int):  return bool(v)
     if isinstance(v, str):  return v.lower() in ("true", "1", "yes")
     return False
+
+
+def _coerce_non_neg_int(v, default: int = 0) -> int:
+    try:
+        i = int(v)
+        return i if i >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_linguistics_from_model(raw: dict, transcript: str) -> dict:
+    """Shape model-provided linguistics; fill counts from transcript when the model omits them."""
+    t = transcript or ""
+    tw = t.strip()
+    neg_w = _safe_list(raw.get("negation_words"))
+    int_w = _safe_list(raw.get("intensifier_words"))
+    dim_w = _safe_list(raw.get("diminisher_words")) + _safe_list(raw.get("diminisher_mentions"))
+    dim_w = list(dict.fromkeys(dim_w))
+    wc = _coerce_non_neg_int(raw.get("word_count"), -1)
+    if wc < 0:
+        wc = len(tw.split()) if tw else 0
+    cc = _coerce_non_neg_int(raw.get("character_count"), -1)
+    if cc < 0:
+        cc = len(t) if t else 0
+    nf = raw.get("negations_found")
+    nf_i = _coerce_non_neg_int(nf, -1) if nf is not None else -1
+    if nf_i < 0:
+        nf_i = len(neg_w)
+    inf = raw.get("intensifiers_found")
+    inf_i = _coerce_non_neg_int(inf, -1) if inf is not None else -1
+    if inf_i < 0:
+        inf_i = len(int_w)
+    df = raw.get("diminishers_found")
+    df_i = _coerce_non_neg_int(df, -1) if df is not None else -1
+    if df_i < 0:
+        df_i = len(dim_w)
+    return {
+        "source": "gpt",
+        "word_count": wc,
+        "character_count": cc,
+        "negation_words": neg_w,
+        "negations_found": nf_i,
+        "intensifier_words": int_w,
+        "intensifiers_found": inf_i,
+        "diminisher_words": dim_w,
+        "diminishers_found": df_i,
+    }
+
+
+def _resolve_linguistics(gpt_result: dict, transcript: str) -> dict:
+    """Prefer structured linguistics from the model; fall back to lightweight heuristics only if absent."""
+    raw = gpt_result.get("linguistics")
+    if isinstance(raw, dict) and len(raw) > 0:
+        return _normalize_linguistics_from_model(raw, transcript)
+    fb = extract_linguistic_features(transcript or "")
+    fb["source"] = "heuristic_fallback"
+    return fb
+
+
+def _gpt_usage_block(token_usage: dict) -> dict:
+    return {
+        "prompt_tokens": _coerce_non_neg_int(token_usage.get("prompt_tokens"), 0),
+        "completion_tokens": _coerce_non_neg_int(token_usage.get("completion_tokens"), 0),
+        "total_tokens": _coerce_non_neg_int(token_usage.get("total_tokens"), 0),
+    }
 
 
 def _override_segment_sentiments(
@@ -180,6 +248,10 @@ def run_pipeline(audio_path: str) -> dict:
         for si in raw_seg_insights if isinstance(si, dict)
     ]
 
+    action_items = _safe_list(gpt_result.get("action_items", []))
+    if not action_items and (gpt_result.get("recommended_action") or "").strip():
+        action_items = [gpt_result["recommended_action"].strip()]
+
     return {
         "transcript": transcript,
         "audio": audio_out,
@@ -201,7 +273,7 @@ def run_pipeline(audio_path: str) -> dict:
             "negative_statements": _safe_list(gpt_result.get("negative_statements", [])),
             "key_topics":         _safe_list(gpt_result.get("key_topics", [])),
             "key_phrases_detected": _safe_list(gpt_result.get("key_phrases_detected", [])),
-            "action_items":       _safe_list(gpt_result.get("action_items", [])),
+            "action_items":       action_items,
             "unresolved_issues":  _safe_list(gpt_result.get("unresolved_issues", [])),
             "supporting_evidence": _safe_list(gpt_result.get("supporting_evidence", [])),
             "decision_chain":     _safe_list(gpt_result.get("decision_chain", [])),
@@ -211,6 +283,9 @@ def run_pipeline(audio_path: str) -> dict:
             "speakers":           speakers_out,
             "segment_insights":   seg_insights_out,
             "summary":            gpt_result.get("summary", ""),
+            "linguistics":        _resolve_linguistics(gpt_result, transcript or ""),
+            "topic_lexicon":      TOPIC_LEXICON_LABEL,
+            "gpt_usage":          _gpt_usage_block(token_usage),
         },
         "usage": {
             "whisper_duration_minutes": transcription["duration_minutes"],

@@ -20,6 +20,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from app.config.settings import settings
 from app.routes.analyze import run_pipeline
 from app.routes.analyze_text import run_text_pipeline
+from app.services.linguistics import extract_linguistic_features
+
+TOPIC_LEXICON_LABEL = "standard"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("voxintent")
@@ -921,6 +924,32 @@ def submitter_name_map_for_items(db: Session, items: list[Feedback], permissions
     return {u.id: u.name for u in users}
 
 
+def _safe_list_serialize(v):
+    if isinstance(v, list):
+        return v
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v] if v.strip() else []
+    return []
+
+
+def enrich_analysis_dict(analysis: dict | None, raw_text: str) -> None:
+    """Ensure linguistics (legacy rows only), topic lexicon label, and action_items backfill for API responses."""
+    if not isinstance(analysis, dict):
+        return
+    text = (raw_text or "").strip()
+    if text and "linguistics" not in analysis:
+        analysis["linguistics"] = extract_linguistic_features(text)
+        analysis["linguistics"]["source"] = "heuristic_fallback"
+    if "topic_lexicon" not in analysis:
+        analysis["topic_lexicon"] = TOPIC_LEXICON_LABEL
+    items = _safe_list_serialize(analysis.get("action_items"))
+    rec = (analysis.get("recommended_action") or "").strip()
+    if not items and rec:
+        analysis["action_items"] = [rec]
+
+
 @app.get("/meta/feedback-form")
 def feedback_form_meta(db: Session = Depends(get_db)):
     sources = db.scalars(select(FeedbackSource).where(FeedbackSource.is_active == True).order_by(FeedbackSource.name)).all()  # noqa: E712
@@ -943,6 +972,11 @@ def serialize_feedback(it: Feedback, permissions: set[str], submitter_names: dic
         except Exception:
             analysis_payload = None
     if analysis_payload and isinstance(analysis_payload, dict):
+        raw_for_features = (
+            str(analysis_payload.get("transcript_original") or "").strip()
+            or str(it.original_message or "").strip()
+            or str(it.message or "").strip()
+        )
         # transcript selection
         if can_view_original_transcript and analysis_payload.get("transcript_original"):
             analysis_payload["transcript"] = analysis_payload.get("transcript_original")
@@ -954,6 +988,33 @@ def serialize_feedback(it: Feedback, permissions: set[str], submitter_names: dic
             analysis_payload["analysis"] = analysis_payload.get("analysis_original")
         else:
             analysis_payload["analysis"] = redact_analysis_obj(analysis_payload.get("analysis"))
+
+        if can_view_analysis:
+            an = analysis_payload.get("analysis")
+            usage_obj = analysis_payload.get("usage") if isinstance(analysis_payload.get("usage"), dict) else {}
+            if isinstance(an, dict) and usage_obj:
+                gu = an.get("gpt_usage")
+                need_backfill = not isinstance(gu, dict) or (
+                    int(gu.get("total_tokens") or 0) == 0
+                    and int(gu.get("prompt_tokens") or 0) == 0
+                )
+                if need_backfill and (
+                    usage_obj.get("gpt_prompt_tokens") is not None
+                    or usage_obj.get("gpt_completion_tokens") is not None
+                    or usage_obj.get("gpt_total_tokens") is not None
+                ):
+                    an["gpt_usage"] = {
+                        "prompt_tokens": int(usage_obj.get("gpt_prompt_tokens") or 0),
+                        "completion_tokens": int(usage_obj.get("gpt_completion_tokens") or 0),
+                        "total_tokens": int(usage_obj.get("gpt_total_tokens") or 0),
+                    }
+            enrich_analysis_dict(analysis_payload.get("analysis"), raw_for_features)
+
+        viewer_saw_unredacted = bool(can_view_original_transcript and analysis_payload.get("transcript_original"))
+        analysis_payload["transcript_privacy"] = build_transcript_privacy_meta(
+            str(analysis_payload.get("transcript") or ""),
+            viewer_saw_unredacted,
+        )
 
         analysis_payload.pop("transcript_original", None)
         analysis_payload.pop("analysis_original", None)
@@ -1020,6 +1081,37 @@ def redact_sensitive_text(text: str) -> str:
     out = re.sub(r"\b(Professor|Dr|Mr|Mrs|Ms)\s+[A-Z][a-zA-Z]+\b", r"\1 [REDACTED]", out)
     out = re.sub(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}\b", "[NAME]", out)
     return out
+
+
+_PRIVACY_MARKERS = ("[REDACTED]", "[EMAIL]", "[PHONE]", "[NAME]")
+
+
+def build_transcript_privacy_meta(shown_transcript: str, viewer_received_unredacted: bool) -> dict:
+    """
+    Describe privacy masking visible in the transcript string served to the client.
+    Masking is applied at persistence (see ingest) and/or in serialize_feedback for role-based display.
+    """
+    shown = shown_transcript or ""
+    total = sum(shown.count(m) for m in _PRIVACY_MARKERS)
+    types: list[str] = []
+    if "[EMAIL]" in shown:
+        types.append("email")
+    if "[PHONE]" in shown:
+        types.append("phone")
+    if "[REDACTED]" in shown:
+        types.append("salutation_or_placeholder")
+    if "[NAME]" in shown:
+        types.append("capitalized_name_pattern")
+    return {
+        "identifiers_visible_as_masked": total > 0,
+        "approx_masking_tokens": total,
+        "masking_token_types": types,
+        "viewer_received_unredacted_transcript": viewer_received_unredacted,
+        "explanation": (
+            "Privacy masking is applied when saving feedback and/or when serving text to viewers without access to "
+            "unredacted content. Placeholders such as [REDACTED] or [NAME] are not produced by the LLM analysis step itself."
+        ),
+    }
 
 
 def redact_analysis_obj(obj):

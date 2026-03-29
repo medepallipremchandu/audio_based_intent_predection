@@ -1,6 +1,13 @@
 import logging
 from app.services.gpt import analyze
-from app.routes.analyze import _safe_list, _safe_bool, _override_segment_sentiments
+from app.routes.analyze import (
+    TOPIC_LEXICON_LABEL,
+    _gpt_usage_block,
+    _resolve_linguistics,
+    _safe_bool,
+    _safe_list,
+    _override_segment_sentiments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +40,10 @@ def run_text_pipeline(text: str) -> dict:
         transcript=text,
     )
 
+    action_items = _safe_list(gpt_result.get("action_items", []))
+    if not action_items and (gpt_result.get("recommended_action") or "").strip():
+        action_items = [gpt_result["recommended_action"].strip()]
+
     return {
         "transcript": text,
         "audio": None,
@@ -54,7 +65,7 @@ def run_text_pipeline(text: str) -> dict:
             "negative_statements": _safe_list(gpt_result.get("negative_statements", [])),
             "key_topics":          _safe_list(gpt_result.get("key_topics", [])),
             "key_phrases_detected": _safe_list(gpt_result.get("key_phrases_detected", [])),
-            "action_items":        _safe_list(gpt_result.get("action_items", [])),
+            "action_items":        action_items,
             "unresolved_issues":   _safe_list(gpt_result.get("unresolved_issues", [])),
             "supporting_evidence": _safe_list(gpt_result.get("supporting_evidence", [])),
             "decision_chain":      _safe_list(gpt_result.get("decision_chain", [])),
@@ -64,6 +75,9 @@ def run_text_pipeline(text: str) -> dict:
             "speakers":            speakers_out,
             "segment_insights":    raw_seg_insights,
             "summary":             gpt_result.get("summary", ""),
+            "linguistics":         _resolve_linguistics(gpt_result, text or ""),
+            "topic_lexicon":       TOPIC_LEXICON_LABEL,
+            "gpt_usage":           _gpt_usage_block(token_usage),
         },
         "usage": {
             "whisper_duration_minutes": 0,

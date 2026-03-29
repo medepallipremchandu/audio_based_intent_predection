@@ -57,6 +57,17 @@ Each segment = {segment_duration} seconds. Use to detect tone shifts, negativity
   "sentiment_score": float -1.0 to 1.0 (negative = bad, positive = good),
   "signal_count": integer — number of sentiment signals found,
 
+  "linguistics": {{
+    "word_count": integer — exact word count of the transcript text,
+    "character_count": integer — character count of the transcript including spaces,
+    "negation_words": ["negation or negative-polarity function words actually appearing in the transcript, e.g. not, never, no, neither"],
+    "negations_found": integer — count of linguistic negation cues in the transcript (words like not/never; NOT the same as negative sentiment or toxicity),
+    "intensifier_words": ["degree words present in transcript, e.g. very, extremely, really — empty array if none"],
+    "intensifiers_found": integer,
+    "diminisher_words": ["hedging/softeners present, e.g. slightly, somewhat, kind of — empty if none"],
+    "diminishers_found": integer
+  }},
+
   "conflict_detected": boolean,
   "negativity_detected": boolean,
   "sarcasm_detected": boolean,
