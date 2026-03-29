@@ -778,6 +778,7 @@ def my_feedback(
     source_id: int | None = None,
     department_id: int | None = None,
     course_code: str | None = None,
+    priority: str | None = None,
     page: int = 1,
     page_size: int = 10,
     user: User = Depends(require_permissions({"feedback.read_own"})),
@@ -800,6 +801,8 @@ def my_feedback(
         stmt = stmt.where(Feedback.department_id == department_id)
     if course_code:
         stmt = stmt.where(Feedback.course_code.ilike(f"%{course_code}%"))
+    if priority:
+        stmt = stmt.where(Feedback.priority == priority)
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     items = db.scalars(stmt.offset((page - 1) * page_size).limit(page_size)).all()
     if "feedback.sensitive.mask" not in permissions and "system.superadmin" not in permissions:
