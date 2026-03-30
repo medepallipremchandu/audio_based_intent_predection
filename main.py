@@ -835,7 +835,12 @@ def my_feedback(
     if priority:
         stmt = stmt.where(Feedback.priority == priority)
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    items = db.scalars(stmt.offset((page - 1) * page_size).limit(page_size)).all()
+    # page_size<=0 means "no limit" (fetch all matching rows).
+    items = (
+        db.scalars(stmt).all()
+        if page_size <= 0
+        else db.scalars(stmt.offset((page - 1) * page_size).limit(page_size)).all()
+    )
     if "feedback.sensitive.mask" not in permissions and "system.superadmin" not in permissions:
         changed = False
         for item in items:
@@ -883,7 +888,12 @@ def list_feedback(
     if priority:
         stmt = stmt.where(Feedback.priority == priority)
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    items = db.scalars(stmt.offset((page - 1) * page_size).limit(page_size)).all()
+    # page_size<=0 means "no limit" (fetch all matching rows).
+    items = (
+        db.scalars(stmt).all()
+        if page_size <= 0
+        else db.scalars(stmt.offset((page - 1) * page_size).limit(page_size)).all()
+    )
     if "feedback.sensitive.mask" not in permissions and "system.superadmin" not in permissions:
         changed = False
         for item in items:
@@ -945,6 +955,103 @@ def dashboard_summary(user: User = Depends(auth_user), db: Session = Depends(get
         response["gpt_cost_usd"] = float(db.scalar(select(func.coalesce(func.sum(base_sq.c.gpt_cost_usd), 0)).select_from(base_sq)) or 0)
         response["total_ai_cost_usd"] = float(db.scalar(select(func.coalesce(func.sum(base_sq.c.total_cost_usd), 0)).select_from(base_sq)) or 0)
     return response
+
+
+@app.get("/dashboard/aggregates")
+def dashboard_aggregates(user: User = Depends(auth_user), db: Session = Depends(get_db)):
+    """
+    Small aggregate payload for dashboards (sentiment mix + top topics).
+    This prevents the frontend from downloading *all* feedback rows.
+    """
+    permissions = get_user_permissions(user)
+    condition = Feedback.submitted_by == user.id if "feedback.read_all" not in permissions else True
+
+    # Sentiment counts (null/empty sentiment => neutral)
+    sentiment_key = func.lower(func.coalesce(func.nullif(Feedback.sentiment, ""), "neutral"))
+    total = db.scalar(select(func.count()).select_from(Feedback).where(condition)) or 0
+
+    sentiment_rows = db.execute(
+        select(sentiment_key, func.count()).select_from(Feedback).where(condition).group_by(sentiment_key)
+    ).all()
+    sentiment_counts: dict[str, int] = {str(k): int(v) for k, v in sentiment_rows}
+
+    # Top topics: parse analysis_json to extract analysis.analysis.primary_topic (fallback to intent).
+    topic_counts: dict[str, int] = {}
+    topic_rows = db.execute(select(Feedback.analysis_json, Feedback.intent).select_from(Feedback).where(condition)).all()
+    for analysis_json, intent in topic_rows:
+        topic = None
+        if analysis_json:
+            try:
+                payload = json.loads(analysis_json)
+                analysis_block = payload.get("analysis") if isinstance(payload, dict) else {}
+                if isinstance(analysis_block, dict):
+                    topic = analysis_block.get("primary_topic")
+                if not topic:
+                    analysis_original = payload.get("analysis_original") if isinstance(payload, dict) else {}
+                    if isinstance(analysis_original, dict):
+                        topic = analysis_original.get("primary_topic")
+            except Exception:
+                topic = None
+        if not topic:
+            topic = intent
+        if topic:
+            topic_counts[str(topic)] = topic_counts.get(str(topic), 0) + 1
+
+    # Sort by count desc, then topic asc (case-insensitive) for stable ordering.
+    top_topics_sorted = sorted(topic_counts.items(), key=lambda kv: (-kv[1], str(kv[0]).lower()))
+    top_topics = [{"topic": t, "count": int(c)} for t, c in top_topics_sorted[:8]]
+
+    primary_topic = top_topics_sorted[0][0] if top_topics_sorted else "general feedback trends"
+    mixed_like_count = (sentiment_counts.get("mixed", 0) + sentiment_counts.get("neutral", 0) + sentiment_counts.get("inconclusive", 0))
+    mixed_like_pct = round((mixed_like_count / total) * 100) if total else 0
+
+    return {
+        "total_rows": int(total),
+        "sentiment_counts": sentiment_counts,
+        "top_topics": top_topics,
+        "primary_topic": primary_topic,
+        "mixed_like_pct": mixed_like_pct,
+    }
+
+
+@app.get("/dashboard/recent")
+def dashboard_recent(
+    page: int = 1,
+    page_size: int = 10,
+    user: User = Depends(auth_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Paginated recent feedback list for dashboard "Latest activity".
+    Used by infinite scroll so we don't load the entire dataset.
+    """
+    permissions = get_user_permissions(user)
+    page = max(1, int(page))
+    page_size = max(1, int(page_size))
+
+    base = select(Feedback).order_by(Feedback.created_at.desc())
+    if "feedback.read_all" not in permissions:
+        base = base.where(Feedback.submitted_by == user.id)
+
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+
+    stmt = base.offset((page - 1) * page_size).limit(page_size)
+    items = db.scalars(stmt).all()
+
+    if "feedback.sensitive.mask" not in permissions and "system.superadmin" not in permissions:
+        changed = False
+        for item in items:
+            changed = maybe_backfill_unmasked_analysis(item) or changed
+        if changed:
+            db.commit()
+
+    name_map = submitter_name_map_for_items(db, items, permissions)
+    return {
+        "items": [serialize_feedback(it, permissions, submitter_names=name_map) for it in items],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 def submitter_name_map_for_items(db: Session, items: list[Feedback], permissions: set[str]) -> dict[int, str] | None:
