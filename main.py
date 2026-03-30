@@ -753,6 +753,13 @@ async def create_public_audio_feedback(
     return {"id": feedback.id, "message": "Audio feedback submitted successfully"}
 
 
+def _safe_audio_filename(name: str | None, feedback_id: int) -> str:
+    raw = (name or "").strip() or f"feedback-{feedback_id}.audio"
+    raw = re.sub(r"[^\w.\-() ]+", "_", raw)
+    raw = raw.replace("..", "_").strip() or f"feedback-{feedback_id}.audio"
+    return raw[:200]
+
+
 @app.get("/feedback/{feedback_id}/audio")
 def get_feedback_audio(feedback_id: int, user: User = Depends(auth_user), db: Session = Depends(get_db)):
     feedback = db.get(Feedback, feedback_id)
@@ -767,6 +774,30 @@ def get_feedback_audio(feedback_id: int, user: User = Depends(auth_user), db: Se
     if not feedback.audio_blob:
         raise HTTPException(status_code=404, detail="Audio not available")
     return Response(content=feedback.audio_blob, media_type=feedback.audio_mime or "audio/mpeg")
+
+
+@app.get("/feedback/{feedback_id}/audio/download")
+def download_feedback_audio(feedback_id: int, user: User = Depends(auth_user), db: Session = Depends(get_db)):
+    """Same read scope as playback, plus `feedback.audio.download` (or superadmin)."""
+    feedback = db.get(Feedback, feedback_id)
+    if not feedback:
+        raise HTTPException(status_code=404, detail="Feedback not found")
+    permissions = get_user_permissions(user)
+    can_read_all = "feedback.read_all" in permissions or "system.superadmin" in permissions
+    can_read_own = feedback.submitted_by == user.id and "feedback.read_own" in permissions
+    can_read_assigned = feedback.assigned_to == user.id and "feedback.read_assigned" in permissions
+    if not (can_read_all or can_read_own or can_read_assigned):
+        raise HTTPException(status_code=403, detail="Not allowed to access this audio")
+    if "feedback.audio.download" not in permissions and "system.superadmin" not in permissions:
+        raise HTTPException(status_code=403, detail="Missing permission to download audio")
+    if not feedback.audio_blob:
+        raise HTTPException(status_code=404, detail="Audio not available")
+    filename = _safe_audio_filename(feedback.audio_file, feedback_id)
+    return Response(
+        content=feedback.audio_blob,
+        media_type=feedback.audio_mime or "audio/mpeg",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/feedback/mine")

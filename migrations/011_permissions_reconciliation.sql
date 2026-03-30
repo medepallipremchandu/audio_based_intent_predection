@@ -27,6 +27,7 @@ VALUES
 ('feedback.sensitive.view', 'View Sensitive Content', 'Legacy visibility flag for sensitive fields. Masking behavior is primarily controlled by feedback.sensitive.mask.', 'feedback_board'),
 ('feedback.sensitive.mask', 'Mask Sensitive Content', 'When enabled for a role, sensitive content is redacted in message/transcript/analysis fields.', 'feedback_board'),
 ('feedback.submitter.view', 'View Submitter Name', 'Shows who submitted each feedback item (e.g. beside the timestamp on the feedback board).', 'feedback_board'),
+('feedback.audio.download', 'Download Original Audio', 'Allows downloading the stored audio file from the Audio Signal tab. In-app playback does not require this permission.', 'feedback_board'),
 ('dashboard.view', 'View Dashboard', 'Allows opening dashboard tab and viewing dashboard metrics.', 'dashboard'),
 ('ai.cost.view', 'View AI Cost Metrics', 'Allows viewing Whisper/GPT/total AI processing cost metrics.', 'dashboard')
 ON CONFLICT (key) DO UPDATE SET
@@ -52,6 +53,7 @@ JOIN permissions p ON p.key IN (
   'feedback.read_all', 'feedback.update',
   'feedback.analysis.view', 'feedback.transcript.original.view', 'feedback.sensitive.view',
   'feedback.submitter.view',
+  'feedback.audio.download',
   'dashboard.view', 'ai.cost.view'
 )
 WHERE r.name = 'admin'
@@ -60,14 +62,14 @@ ON CONFLICT DO NOTHING;
 INSERT INTO role_permissions (role_id, permission_id)
 SELECT r.id, p.id
 FROM roles r
-JOIN permissions p ON p.key IN ('feedback.create', 'feedback.read_own', 'dashboard.view', 'feedback.sensitive.mask')
+JOIN permissions p ON p.key IN ('feedback.create', 'feedback.read_own', 'feedback.audio.download', 'dashboard.view', 'feedback.sensitive.mask')
 WHERE r.name = 'student'
 ON CONFLICT DO NOTHING;
 
 INSERT INTO role_permissions (role_id, permission_id)
 SELECT r.id, p.id
 FROM roles r
-JOIN permissions p ON p.key IN ('feedback.read_assigned', 'feedback.update', 'feedback.analysis.view', 'feedback.submitter.view', 'dashboard.view', 'feedback.sensitive.mask')
+JOIN permissions p ON p.key IN ('feedback.read_assigned', 'feedback.update', 'feedback.analysis.view', 'feedback.submitter.view', 'feedback.audio.download', 'dashboard.view', 'feedback.sensitive.mask')
 WHERE r.name = 'resolver'
 ON CONFLICT DO NOTHING;
 
@@ -78,6 +80,7 @@ JOIN permissions p ON p.key IN (
   'feedback.read_all', 'feedback.assign',
   'feedback.analysis.view', 'feedback.transcript.original.view', 'feedback.sensitive.view',
   'feedback.submitter.view',
+  'feedback.audio.download',
   'dashboard.view', 'ai.cost.view', 'feedback.sensitive.mask'
 )
 WHERE r.name = 'tracker'
