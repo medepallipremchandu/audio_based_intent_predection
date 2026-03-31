@@ -70,8 +70,11 @@ def analyze(transcript: str, audio_features: dict) -> dict:
         raw = raw.strip()
 
     usage = response.usage
-    input_cost  = (usage.prompt_tokens / 1000) * 0.03
-    output_cost = (usage.completion_tokens / 1000) * 0.06
+    # Cost is derived purely from Azure usage + prices configured in settings.
+    input_price = settings.AZURE_GPT_INPUT_PRICE_PER_1K
+    output_price = settings.AZURE_GPT_OUTPUT_PRICE_PER_1K
+    input_cost = (usage.prompt_tokens / 1000) * input_price
+    output_cost = (usage.completion_tokens / 1000) * output_price
 
     result = json.loads(raw)
     result["_token_usage"] = {
