@@ -1,6 +1,8 @@
 import datetime
+import csv
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -13,7 +15,7 @@ import jwt
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator, model_validator
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, func, or_, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -21,6 +23,7 @@ from app.config.settings import settings
 from app.routes.analyze import run_pipeline
 from app.routes.analyze_text import run_text_pipeline
 from app.services.linguistics import extract_linguistic_features
+from app.services.social_collect import merge_preview
 
 TOPIC_LEXICON_LABEL = "standard"
 
@@ -247,6 +250,62 @@ class CreateFeedbackRequest(BaseModel):
     source_id: int | None = None
     department_id: int | None = None
     course_code: str | None = None
+
+
+class SocialPreviewRequest(BaseModel):
+    start_date: datetime.date
+    end_date: datetime.date
+    platforms: list[str]
+    include_reddit_comments: bool = False
+    limit_per_subreddit: int = 30
+    consent_fetch_public_data: bool = False
+
+    @field_validator("platforms")
+    @classmethod
+    def _platforms(cls, v: list[str]) -> list[str]:
+        allowed = {"reddit", "bluesky"}
+        out = sorted({p.lower().strip() for p in v if p.lower().strip() in allowed})
+        if not out:
+            raise ValueError("Select at least one platform: reddit, bluesky")
+        return list(out)
+
+    @model_validator(mode="after")
+    def _dates(self):
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be on or after start_date")
+        if (self.end_date - self.start_date).days > 366:
+            raise ValueError("Date range too wide (max 366 days)")
+        lim = int(self.limit_per_subreddit)
+        if lim < 5 or lim > 100:
+            raise ValueError("limit_per_subreddit must be between 5 and 100")
+        return self
+
+
+class SocialImportItem(BaseModel):
+    import_key: str
+    platform: str
+    post_id: str
+    channel: str
+    university_matched: str
+    post_type: str
+    title: str | None = None
+    content: str
+    timestamp_utc: str
+    url: str
+
+
+class SocialImportRequest(BaseModel):
+    items: list[SocialImportItem]
+    run_ai_analysis: bool = False
+    source_id: int | None = None
+    department_id: int | None = None
+
+    @field_validator("items")
+    @classmethod
+    def _cap(cls, v: list[SocialImportItem]) -> list[SocialImportItem]:
+        if len(v) > 50:
+            raise ValueError("Maximum 50 items per import batch")
+        return v
 
 
 class UpdateFeedbackRequest(BaseModel):
@@ -552,6 +611,112 @@ def create_feedback(payload: CreateFeedbackRequest, user: User = Depends(require
     db.commit()
     db.refresh(feedback)
     return {"id": feedback.id, "message": "Feedback submitted successfully"}
+
+
+@app.post("/feedback/bulk-csv")
+async def create_feedback_bulk_csv(
+    file: UploadFile = File(...),
+    source_id: int | None = Form(default=None),
+    department_id: int | None = Form(default=None),
+    course_code: str | None = Form(default=None),
+    user: User = Depends(require_permissions({"feedback.create", "feedback.bulk_csv"})),
+    db: Session = Depends(get_db),
+):
+    name = (file.filename or "").lower()
+    if not name.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV uploads are supported.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded CSV is empty.")
+    try:
+        decoded = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="CSV must be UTF-8 encoded.")
+
+    reader = csv.DictReader(io.StringIO(decoded))
+    headers = [h.strip().lower() for h in (reader.fieldnames or []) if h]
+    if "text" not in headers:
+        raise HTTPException(status_code=400, detail='CSV must include a "text" column.')
+
+    sources = db.scalars(select(FeedbackSource)).all()
+    departments = db.scalars(select(Department)).all()
+    source_by_name = {s.name.strip().lower(): s.id for s in sources if s.name}
+    department_by_name = {d.name.strip().lower(): d.id for d in departments if d.name}
+
+    def _parse_id(raw, by_name: dict[str, int], fallback: int | None):
+        if raw is None:
+            return fallback
+        val = str(raw).strip()
+        if not val:
+            return fallback
+        if val.isdigit():
+            return int(val)
+        return by_name.get(val.lower(), fallback)
+
+    created = 0
+    for i, row in enumerate(reader, start=1):
+        if i > 500:
+            raise HTTPException(status_code=400, detail="CSV row limit exceeded (max 500 rows).")
+        row_lc = {(k or "").strip().lower(): v for k, v in row.items()}
+        text_value = (row_lc.get("text") or "").strip()
+        if not text_value:
+            continue
+        if len(text_value) < 10:
+            raise HTTPException(status_code=400, detail=f"Row {i}: text must be at least 10 characters.")
+
+        row_source_id = _parse_id(row_lc.get("source_id") or row_lc.get("source"), source_by_name, source_id)
+        row_department_id = _parse_id(row_lc.get("department_id") or row_lc.get("department"), department_by_name, department_id)
+        row_course_code = (row_lc.get("course_code") or "").strip() or course_code
+
+        intent = None
+        sentiment = None
+        analysis_payload = {}
+        try:
+            analysis = run_text_pipeline(text_value)
+            analysis_block = analysis.get("analysis", {})
+            intent = analysis_block.get("primary_topic")
+            sentiment = analysis_block.get("overall_sentiment")
+            usage = analysis.get("usage", {})
+            transcript = analysis.get("transcript", text_value)
+            analysis_payload = {
+                "transcript": redact_sensitive_text(transcript),
+                "transcript_original": transcript,
+                "analysis": redact_analysis_obj(analysis_block),
+                "analysis_original": analysis_block,
+                "usage": usage,
+            }
+            priority = derive_priority(analysis_block)
+        except Exception:
+            usage = {}
+            priority = "medium"
+            logger.warning("Bulk text analysis failed for row %s; continuing with fallback values", i)
+
+        feedback = Feedback(
+            title=make_title(text_value),
+            message=redact_sensitive_text(text_value),
+            original_message=text_value,
+            input_type="text",
+            analysis_json=json.dumps(analysis_payload) if analysis_payload else None,
+            priority=priority,
+            source_id=row_source_id,
+            department_id=row_department_id,
+            course_code=normalize_course_code(row_course_code),
+            submitted_by=user.id,
+            intent=intent,
+            sentiment=sentiment,
+            whisper_cost_usd=float(usage.get("whisper_cost_usd", 0) or 0),
+            gpt_cost_usd=float(usage.get("gpt_cost_usd", 0) or 0),
+            total_cost_usd=float(usage.get("total_cost_usd", 0) or 0),
+            status="soon",
+        )
+        db.add(feedback)
+        created += 1
+
+    if created == 0:
+        raise HTTPException(status_code=400, detail='No valid rows found. Ensure CSV has non-empty "text" values.')
+
+    db.commit()
+    return {"imported": created, "message": "Bulk CSV feedback imported successfully"}
 
 
 @app.post("/feedback/public")
@@ -1099,6 +1264,183 @@ def feedback_form_meta(db: Session = Depends(get_db)):
         "sources": [{"id": source.id, "name": source.name} for source in sources],
         "departments": [{"id": department.id, "name": department.name} for department in departments],
     }
+
+
+@app.get("/integrations/social/status")
+def social_integration_status(_: User = Depends(require_permissions({"social_feed.demo"}))):
+    reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
+    reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
+    reddit_oauth_configured = bool(reddit_client_id and reddit_client_secret)
+    return {
+        "bluesky_available": True,
+        "reddit_oauth_configured": reddit_oauth_configured,
+        "reddit_connected": reddit_oauth_configured,
+        "hint": "Reddit submissions work without OAuth; OAuth + praw is required for Reddit comments when enabled.",
+    }
+
+
+@app.post("/integrations/social/preview")
+def social_preview(
+    payload: SocialPreviewRequest,
+    _: User = Depends(require_permissions({"social_feed.demo"})),
+):
+    if not payload.consent_fetch_public_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Consent required: set consent_fetch_public_data to true after acknowledging public-data use.",
+        )
+    rows, warnings = merge_preview(
+        payload.start_date,
+        payload.end_date,
+        payload.platforms,
+        payload.include_reddit_comments,
+        payload.limit_per_subreddit,
+    )
+    return {"rows": rows, "warnings": warnings, "count": len(rows)}
+
+
+def _persist_social_import(
+    db: Session,
+    user: User,
+    item: SocialImportItem,
+    run_ai_analysis: bool,
+    source_id: int | None,
+    department_id: int | None,
+) -> Feedback:
+    plat = (item.platform or "").strip().lower()
+    input_type = "reddit" if "reddit" in plat else "bluesky"
+    raw_title = (item.title or "").strip()
+    body = (item.content or "").strip()
+    if len(body) < 3:
+        raise HTTPException(status_code=400, detail="Each item must include content (min 3 characters).")
+    combined = body[:12000]
+    footer = (
+        f"\n\n— Imported ({item.platform}) · {item.university_matched} · {item.timestamp_utc}\n"
+        f"Link: {item.url}\nExternal post id: {item.post_id}"
+    )
+    message = (combined + footer)[:20000]
+    head = raw_title if raw_title else f"{item.channel} · {item.university_matched}"
+    display_title = f"[{item.platform}] {head}"[:175]
+
+    if run_ai_analysis:
+        intent = None
+        sentiment = None
+        analysis_payload: dict = {}
+        usage: dict = {}
+        priority = "medium"
+        try:
+            analysis = run_text_pipeline(message)
+            analysis_block = analysis.get("analysis", {})
+            intent = analysis_block.get("primary_topic")
+            sentiment = analysis_block.get("overall_sentiment")
+            usage = analysis.get("usage", {})
+            transcript = analysis.get("transcript", message)
+            analysis_payload = {
+                "transcript": redact_sensitive_text(transcript),
+                "transcript_original": transcript,
+                "analysis": redact_analysis_obj(analysis_block),
+                "analysis_original": analysis_block,
+                "usage": usage,
+                "social_import": {
+                    "import_key": item.import_key,
+                    "url": item.url,
+                    "channel": item.channel,
+                    "post_type": item.post_type,
+                    "university_matched": item.university_matched,
+                },
+            }
+            priority = derive_priority(analysis_block)
+        except Exception:
+            logger.warning("Social import AI analysis failed; saving row without intent/sentiment")
+            analysis_payload = {
+                "transcript": redact_sensitive_text(message),
+                "transcript_original": message,
+                "analysis": None,
+                "usage": {},
+                "social_import": {
+                    "import_key": item.import_key,
+                    "url": item.url,
+                    "channel": item.channel,
+                    "post_type": item.post_type,
+                    "university_matched": item.university_matched,
+                },
+            }
+        feedback = Feedback(
+            title=make_title(display_title),
+            message=redact_sensitive_text(message),
+            original_message=message,
+            input_type=input_type[:20],
+            analysis_json=json.dumps(analysis_payload) if analysis_payload else None,
+            priority=priority,
+            source_id=source_id,
+            department_id=department_id,
+            course_code=None,
+            submitted_by=user.id,
+            intent=intent,
+            sentiment=sentiment,
+            whisper_cost_usd=float(usage.get("whisper_cost_usd", 0) or 0),
+            gpt_cost_usd=float(usage.get("gpt_cost_usd", 0) or 0),
+            total_cost_usd=float(usage.get("total_cost_usd", 0) or 0),
+            status="soon",
+        )
+        db.add(feedback)
+        return feedback
+
+    analysis_payload = {
+        "transcript": redact_sensitive_text(message),
+        "transcript_original": message,
+        "analysis": None,
+        "usage": {},
+        "social_import": {
+            "import_key": item.import_key,
+            "url": item.url,
+            "channel": item.channel,
+            "post_type": item.post_type,
+            "university_matched": item.university_matched,
+        },
+    }
+    feedback = Feedback(
+        title=make_title(display_title),
+        message=redact_sensitive_text(message),
+        original_message=message,
+        input_type=input_type[:20],
+        analysis_json=json.dumps(analysis_payload),
+        priority="medium",
+        source_id=source_id,
+        department_id=department_id,
+        course_code=None,
+        submitted_by=user.id,
+        intent=None,
+        sentiment=None,
+        whisper_cost_usd=0.0,
+        gpt_cost_usd=0.0,
+        total_cost_usd=0.0,
+        status="soon",
+    )
+    db.add(feedback)
+    return feedback
+
+
+@app.post("/integrations/social/import")
+def social_import(
+    payload: SocialImportRequest,
+    user: User = Depends(require_permissions({"social_feed.demo", "feedback.create"})),
+    db: Session = Depends(get_db),
+):
+    ids: list[int] = []
+    for item in payload.items:
+        fb = _persist_social_import(
+            db,
+            user,
+            item,
+            payload.run_ai_analysis,
+            payload.source_id,
+            payload.department_id,
+        )
+        db.commit()
+        db.refresh(fb)
+        ids.append(fb.id)
+    return {"imported": len(ids), "feedback_ids": ids}
 
 
 def serialize_feedback(it: Feedback, permissions: set[str], submitter_names: dict[int, str] | None = None):

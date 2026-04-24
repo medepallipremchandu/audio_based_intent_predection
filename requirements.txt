@@ -11,3 +11,4 @@ soundfile==0.12.1
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.10
 PyJWT==2.10.1
+praw==7.7.1
