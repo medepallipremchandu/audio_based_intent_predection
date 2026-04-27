@@ -44,6 +44,9 @@ This folder keeps **append-only** SQL migrations. Earlier migrations are kept as
 - `013_feedback_audio_download_permission.sql`  
   Adds `feedback.audio.download` (download stored audio from the Audio Signal tab).
 
+- `016_feedbackboard_natural_language_search_permission.sql`  
+  Adds `feedbackboard.naturallanguagesearch` for AI-assisted natural language filter search in My Feedback.
+
 ## Why there are multiple permission migrations
 
 Permissions evolved across features. To avoid breaking already-applied environments, this project keeps historical migrations and adds reconciliation migrations later (instead of rewriting old applied files).

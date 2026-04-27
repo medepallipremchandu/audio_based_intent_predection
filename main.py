@@ -1,5 +1,6 @@
 import datetime
 import csv
+import difflib
 import hashlib
 import hmac
 import io
@@ -9,13 +10,14 @@ import os
 import re
 import shutil
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 
 import jwt
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Response, UploadFile
+from openai import AzureOpenAI
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Header, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, field_validator, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, Text, create_engine, func, or_, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -23,7 +25,12 @@ from app.config.settings import settings
 from app.routes.analyze import run_pipeline
 from app.routes.analyze_text import run_text_pipeline
 from app.services.linguistics import extract_linguistic_features
-from app.services.social_collect import merge_preview
+from app.services.social_collect import (
+    clear_social_probe_cache,
+    get_live_social_connection_flags,
+    merge_preview,
+    parse_keywords_csv,
+)
 
 TOPIC_LEXICON_LABEL = "standard"
 
@@ -36,6 +43,11 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app = FastAPI(title="VoxIntent AI")
 engine = create_engine(settings.DATABASE_URL, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+_nl_filter_ai_client = AzureOpenAI(
+    api_key=settings.AZURE_OPENAI_API_KEY,
+    api_version=settings.AZURE_OPENAI_API_VERSION,
+    azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+)
 
 
 class Base(DeclarativeBase):
@@ -256,6 +268,7 @@ class SocialPreviewRequest(BaseModel):
     start_date: datetime.date
     end_date: datetime.date
     platforms: list[str]
+    keywords: str = Field(..., min_length=1, max_length=8000)
     include_reddit_comments: bool = False
     limit_per_subreddit: int = 30
     consent_fetch_public_data: bool = False
@@ -263,10 +276,10 @@ class SocialPreviewRequest(BaseModel):
     @field_validator("platforms")
     @classmethod
     def _platforms(cls, v: list[str]) -> list[str]:
-        allowed = {"reddit", "bluesky"}
+        allowed = {"reddit", "bluesky", "facebook"}
         out = sorted({p.lower().strip() for p in v if p.lower().strip() in allowed})
         if not out:
-            raise ValueError("Select at least one platform: reddit, bluesky")
+            raise ValueError("Select at least one platform: reddit, bluesky, facebook")
         return list(out)
 
     @model_validator(mode="after")
@@ -292,11 +305,15 @@ class SocialImportItem(BaseModel):
     content: str
     timestamp_utc: str
     url: str
+    author: str = ""
+    run_ai_analysis: bool = Field(
+        default=False,
+        description="If true, run Azure text sentiment on this row only (uses quota).",
+    )
 
 
 class SocialImportRequest(BaseModel):
     items: list[SocialImportItem]
-    run_ai_analysis: bool = False
     source_id: int | None = None
     department_id: int | None = None
 
@@ -318,6 +335,10 @@ class UpdateUserRequest(BaseModel):
     is_active: bool | None = None
     role_ids: list[int] | None = None
     password: str | None = None
+
+
+class NaturalLanguageFilterRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=1200)
 
 
 def hash_password(password: str) -> str:
@@ -965,6 +986,30 @@ def download_feedback_audio(feedback_id: int, user: User = Depends(auth_user), d
     )
 
 
+@app.post("/feedback/natural-language-filters")
+def feedback_natural_language_filters(
+    payload: NaturalLanguageFilterRequest,
+    _: User = Depends(require_permissions({"feedbackboard.naturallanguagesearch"})),
+    db: Session = Depends(get_db),
+):
+    sources = db.scalars(select(FeedbackSource).where(FeedbackSource.is_active == True).order_by(FeedbackSource.name)).all()  # noqa: E712
+    departments = db.scalars(select(Department).where(Department.is_active == True).order_by(Department.name)).all()  # noqa: E712
+    source_options = [{"id": str(s.id), "name": s.name or ""} for s in sources]
+    department_options = [{"id": str(d.id), "name": d.name or ""} for d in departments]
+    source_name_to_id = {str(x["name"]).strip().lower(): str(x["id"]) for x in source_options if str(x["name"]).strip()}
+    department_name_to_id = {str(x["name"]).strip().lower(): str(x["id"]) for x in department_options if str(x["name"]).strip()}
+
+    raw_filters = _parse_natural_language_filters_with_ai(payload.query, source_options, department_options)
+    normalized = _normalize_nl_filters(
+        raw_filters=raw_filters,
+        source_ids={x["id"] for x in source_options},
+        department_ids={x["id"] for x in department_options},
+        source_name_to_id=source_name_to_id,
+        department_name_to_id=department_name_to_id,
+    )
+    return {"filters": normalized}
+
+
 @app.get("/feedback/mine")
 def my_feedback(
     search: str = "",
@@ -1091,11 +1136,32 @@ def update_feedback(feedback_id: int, payload: UpdateFeedbackRequest, user: User
 
 
 @app.get("/dashboard/summary")
-def dashboard_summary(user: User = Depends(auth_user), db: Session = Depends(get_db)):
+def dashboard_summary(
+    status: str | None = None,
+    sentiment: str | None = None,
+    input_type: str | None = None,
+    source_id: int | None = None,
+    department_id: int | None = None,
+    priority: str | None = None,
+    user: User = Depends(auth_user),
+    db: Session = Depends(get_db),
+):
     permissions = get_user_permissions(user)
     base = select(Feedback)
     if "feedback.read_all" not in permissions:
         base = base.where(Feedback.submitted_by == user.id)
+    if status:
+        base = base.where(Feedback.status == status)
+    if sentiment:
+        base = base.where(Feedback.sentiment == sentiment)
+    if input_type:
+        base = base.where(Feedback.input_type == input_type)
+    if source_id is not None:
+        base = base.where(Feedback.source_id == source_id)
+    if department_id is not None:
+        base = base.where(Feedback.department_id == department_id)
+    if priority:
+        base = base.where(Feedback.priority == priority)
     total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
     completed = db.scalar(select(func.count()).select_from(base.where(Feedback.status == "completed").subquery())) or 0
     inprogress = db.scalar(select(func.count()).select_from(base.where(Feedback.status == "inprogress").subquery())) or 0
@@ -1123,26 +1189,51 @@ def dashboard_summary(user: User = Depends(auth_user), db: Session = Depends(get
 
 
 @app.get("/dashboard/aggregates")
-def dashboard_aggregates(user: User = Depends(auth_user), db: Session = Depends(get_db)):
+def dashboard_aggregates(
+    status: str | None = None,
+    sentiment: str | None = None,
+    input_type: str | None = None,
+    source_id: int | None = None,
+    department_id: int | None = None,
+    priority: str | None = None,
+    user: User = Depends(auth_user),
+    db: Session = Depends(get_db),
+):
     """
     Small aggregate payload for dashboards (sentiment mix + top topics).
     This prevents the frontend from downloading *all* feedback rows.
     """
     permissions = get_user_permissions(user)
-    condition = Feedback.submitted_by == user.id if "feedback.read_all" not in permissions else True
+    base = select(Feedback)
+    if "feedback.read_all" not in permissions:
+        base = base.where(Feedback.submitted_by == user.id)
+    if status:
+        base = base.where(Feedback.status == status)
+    if sentiment:
+        base = base.where(Feedback.sentiment == sentiment)
+    if input_type:
+        base = base.where(Feedback.input_type == input_type)
+    if source_id is not None:
+        base = base.where(Feedback.source_id == source_id)
+    if department_id is not None:
+        base = base.where(Feedback.department_id == department_id)
+    if priority:
+        base = base.where(Feedback.priority == priority)
+
+    base_sq = base.subquery()
 
     # Sentiment counts (null/empty sentiment => neutral)
-    sentiment_key = func.lower(func.coalesce(func.nullif(Feedback.sentiment, ""), "neutral"))
-    total = db.scalar(select(func.count()).select_from(Feedback).where(condition)) or 0
+    sentiment_key = func.lower(func.coalesce(func.nullif(base_sq.c.sentiment, ""), "neutral"))
+    total = db.scalar(select(func.count()).select_from(base_sq)) or 0
 
     sentiment_rows = db.execute(
-        select(sentiment_key, func.count()).select_from(Feedback).where(condition).group_by(sentiment_key)
+        select(sentiment_key, func.count()).select_from(base_sq).group_by(sentiment_key)
     ).all()
     sentiment_counts: dict[str, int] = {str(k): int(v) for k, v in sentiment_rows}
 
     # Top topics: parse analysis_json to extract analysis.analysis.primary_topic (fallback to intent).
     topic_counts: dict[str, int] = {}
-    topic_rows = db.execute(select(Feedback.analysis_json, Feedback.intent).select_from(Feedback).where(condition)).all()
+    topic_rows = db.execute(select(base_sq.c.analysis_json, base_sq.c.intent).select_from(base_sq)).all()
     for analysis_json, intent in topic_rows:
         topic = None
         if analysis_json:
@@ -1181,6 +1272,12 @@ def dashboard_aggregates(user: User = Depends(auth_user), db: Session = Depends(
 
 @app.get("/dashboard/recent")
 def dashboard_recent(
+    status: str | None = None,
+    sentiment: str | None = None,
+    input_type: str | None = None,
+    source_id: int | None = None,
+    department_id: int | None = None,
+    priority: str | None = None,
     page: int = 1,
     page_size: int = 10,
     user: User = Depends(auth_user),
@@ -1197,6 +1294,18 @@ def dashboard_recent(
     base = select(Feedback).order_by(Feedback.created_at.desc())
     if "feedback.read_all" not in permissions:
         base = base.where(Feedback.submitted_by == user.id)
+    if status:
+        base = base.where(Feedback.status == status)
+    if sentiment:
+        base = base.where(Feedback.sentiment == sentiment)
+    if input_type:
+        base = base.where(Feedback.input_type == input_type)
+    if source_id is not None:
+        base = base.where(Feedback.source_id == source_id)
+    if department_id is not None:
+        base = base.where(Feedback.department_id == department_id)
+    if priority:
+        base = base.where(Feedback.priority == priority)
 
     total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
 
@@ -1267,15 +1376,54 @@ def feedback_form_meta(db: Session = Depends(get_db)):
 
 
 @app.get("/integrations/social/status")
-def social_integration_status(_: User = Depends(require_permissions({"social_feed.demo"}))):
+def social_integration_status(
+    refresh: bool = Query(False, description="Bypass cached live probes (forces new network checks)."),
+    _: User = Depends(require_permissions({"social_feed.demo"})),
+):
+    if refresh:
+        clear_social_probe_cache()
+    live = get_live_social_connection_flags()
     reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
     reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
     reddit_oauth_configured = bool(reddit_client_id and reddit_client_secret)
+    reddit_ua_configured = bool((os.getenv("REDDIT_USER_AGENT") or "").strip())
+    bsky_ident = (
+        os.getenv("BSKY_IDENTIFIER")
+        or os.getenv("BLUESKY_IDENTIFIER")
+        or os.getenv("BSKY_HANDLE")
+        or os.getenv("BLUESKY_HANDLE")
+    )
+    bsky_pw = os.getenv("BSKY_APP_PASSWORD") or os.getenv("BLUESKY_APP_PASSWORD")
+    bluesky_auth_configured = bool((bsky_ident or "").strip() and (bsky_pw or "").strip())
+    fb_token = (os.getenv("FACEBOOK_ACCESS_TOKEN") or "").strip()
+    fb_page = (os.getenv("FACEBOOK_PAGE_ID") or "").strip()
+    facebook_configured = bool(fb_token and fb_page)
+    rs = live["reddit_search_connected"]
+    ro = live["reddit_oauth_connected"]
     return {
         "bluesky_available": True,
+        "bluesky_auth_configured": bluesky_auth_configured,
+        "bluesky_connected": live["bluesky_connected"],
         "reddit_oauth_configured": reddit_oauth_configured,
-        "reddit_connected": reddit_oauth_configured,
-        "hint": "Reddit submissions work without OAuth; OAuth + praw is required for Reddit comments when enabled.",
+        "reddit_search_connected": rs,
+        "reddit_oauth_connected": ro,
+        "reddit_connected": live["reddit_connected"],
+        "reddit_public_ready": rs,
+        "reddit_user_agent_configured": reddit_ua_configured,
+        "facebook_available": True,
+        "facebook_configured": facebook_configured,
+        "facebook_connected": live["facebook_connected"],
+        "facebook_note": (
+            "Meta Graph API does not offer public global keyword search. "
+            "With FACEBOOK_ACCESS_TOKEN + FACEBOOK_PAGE_ID this demo can fetch posts from that Page only, "
+            "filtered by your keywords in the post text."
+        ),
+        "hint": (
+            "Keywords are comma-separated in the UI. Connection badges reflect live checks (cached ~45s; use refresh=1 to retest). "
+            "Bluesky: public search may return HTTP 403; BSKY_IDENTIFIER + BSKY_APP_PASSWORD often fixes it. "
+            "Reddit search uses a default browser-style User-Agent; set REDDIT_USER_AGENT to override. Comments need OAuth + praw. "
+            "Facebook: Page token + Page id only."
+        ),
     }
 
 
@@ -1289,26 +1437,57 @@ def social_preview(
             status_code=400,
             detail="Consent required: set consent_fetch_public_data to true after acknowledging public-data use.",
         )
+    try:
+        keywords_list = parse_keywords_csv(payload.keywords)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     rows, warnings = merge_preview(
         payload.start_date,
         payload.end_date,
         payload.platforms,
         payload.include_reddit_comments,
         payload.limit_per_subreddit,
+        keywords_list,
     )
     return {"rows": rows, "warnings": warnings, "count": len(rows)}
+
+
+def _social_import_text_for_ai(item: SocialImportItem) -> str:
+    """Single text block for GPT: table columns the operator sees in the preview."""
+    author = (item.author or "").strip() or "unknown"
+    title = (item.title or "").strip()
+    content = (item.content or "").strip()
+    lines = [
+        f"Platform: {(item.platform or '').strip()}",
+        f"Channel: {(item.channel or '').strip()}",
+        f"Type: {(item.post_type or '').strip()}",
+        f"University: {(item.university_matched or '').strip()}",
+        f"Author: {author}",
+        f"When (UTC): {(item.timestamp_utc or '').strip()}",
+        "",
+    ]
+    if title:
+        lines.extend([f"Title: {title}", ""])
+    lines.extend(["Content:", content if content else "(empty)", ""])
+    lines.append(f"Link: {(item.url or '').strip()}")
+    lines.append(f"External post id: {(item.post_id or '').strip()}")
+    return "\n".join(lines)
 
 
 def _persist_social_import(
     db: Session,
     user: User,
     item: SocialImportItem,
-    run_ai_analysis: bool,
     source_id: int | None,
     department_id: int | None,
 ) -> Feedback:
     plat = (item.platform or "").strip().lower()
-    input_type = "reddit" if "reddit" in plat else "bluesky"
+    if "reddit" in plat:
+        input_type = "reddit"
+    elif "facebook" in plat or "meta" in plat:
+        input_type = "facebook"
+    else:
+        input_type = "bluesky"
     raw_title = (item.title or "").strip()
     body = (item.content or "").strip()
     if len(body) < 3:
@@ -1322,19 +1501,22 @@ def _persist_social_import(
     head = raw_title if raw_title else f"{item.channel} · {item.university_matched}"
     display_title = f"[{item.platform}] {head}"[:175]
 
-    if run_ai_analysis:
+    if item.run_ai_analysis:
+        structured = _social_import_text_for_ai(item)
+        pipeline_message = (structured + footer)[:19000]
+        message = (structured + footer)[:20000]
         intent = None
         sentiment = None
         analysis_payload: dict = {}
         usage: dict = {}
         priority = "medium"
         try:
-            analysis = run_text_pipeline(message)
+            analysis = run_text_pipeline(pipeline_message)
             analysis_block = analysis.get("analysis", {})
             intent = analysis_block.get("primary_topic")
             sentiment = analysis_block.get("overall_sentiment")
             usage = analysis.get("usage", {})
-            transcript = analysis.get("transcript", message)
+            transcript = analysis.get("transcript", pipeline_message)
             analysis_payload = {
                 "transcript": redact_sensitive_text(transcript),
                 "transcript_original": transcript,
@@ -1433,7 +1615,6 @@ def social_import(
             db,
             user,
             item,
-            payload.run_ai_analysis,
             payload.source_id,
             payload.department_id,
         )
@@ -1553,6 +1734,169 @@ def derive_priority(analysis: dict) -> str:
     if analysis.get("overall_sentiment") == "neutral":
         return "medium"
     return "low"
+
+
+def _extract_first_json_object(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 2:
+            text = parts[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return {}
+    try:
+        parsed = json.loads(m.group(0))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _coerce_string(v: Any) -> str:
+    return str(v).strip() if v is not None else ""
+
+
+def _parse_natural_language_filters_with_ai(
+    query: str,
+    source_options: list[dict[str, str]],
+    department_options: list[dict[str, str]],
+) -> dict[str, str]:
+    source_text = "\n".join([f'- "{it["name"]}" => "{it["id"]}"' for it in source_options]) or "- none"
+    dept_text = "\n".join([f'- "{it["name"]}" => "{it["id"]}"' for it in department_options]) or "- none"
+    prompt = f"""
+Convert this natural-language query into filter key/value pairs.
+
+FILTER KEYS (allowed):
+- status
+- sentiment
+- input_type
+- source_id
+- department_id
+- priority
+- course_code
+- search
+
+ALLOWED VALUES:
+- status: soon | inprogress | completed
+- sentiment: positive | neutral | negative | mixed
+- input_type: audio | text | reddit | bluesky | facebook
+- priority: high | medium | low
+- source_id: use one id from Source options below
+- department_id: use one id from Department options below
+- course_code/search: plain string only when clearly intended
+
+SOURCE OPTIONS (name => id):
+{source_text}
+
+DEPARTMENT OPTIONS (name => id):
+{dept_text}
+
+TYPO RULE:
+- Correct user spelling mistakes/typos to closest valid values or closest source/department name.
+- If confidence is low, omit that key (do not invent).
+
+OUTPUT RULES:
+- Return strict JSON only with this shape: {{"filters":{{...}}}}.
+- Use only allowed keys and values.
+- Omit keys user did not request.
+- If user intent says "all" / "any", omit that filter key.
+
+User query:
+{query}
+"""
+
+    response = _nl_filter_ai_client.chat.completions.create(
+        model=settings.AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {"role": "system", "content": "You extract structured filter values from user search text."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+    )
+    raw = (response.choices[0].message.content or "").strip()
+    parsed = _extract_first_json_object(raw)
+    filters = parsed.get("filters") if isinstance(parsed, dict) else {}
+    return filters if isinstance(filters, dict) else {}
+
+
+def _normalize_nl_filters(
+    raw_filters: dict[str, Any],
+    source_ids: set[str],
+    department_ids: set[str],
+    source_name_to_id: dict[str, str],
+    department_name_to_id: dict[str, str],
+) -> dict[str, str]:
+    def _closest_from_allowed(value: str, allowed: set[str]) -> str:
+        v = (value or "").strip().lower()
+        if not v:
+            return ""
+        if v in allowed:
+            return v
+        match = difflib.get_close_matches(v, list(allowed), n=1, cutoff=0.75)
+        return match[0] if match else ""
+
+    def _resolve_lookup_value(value: Any, id_set: set[str], name_to_id: dict[str, str]) -> str:
+        raw = _coerce_string(value)
+        if not raw:
+            return ""
+        if raw in id_set:
+            return raw
+        lowered = raw.lower()
+        if lowered in name_to_id:
+            return name_to_id[lowered]
+        # typo-tolerant name mapping
+        match = difflib.get_close_matches(lowered, list(name_to_id.keys()), n=1, cutoff=0.75)
+        return name_to_id[match[0]] if match else ""
+
+    out: dict[str, str] = {}
+
+    status = _closest_from_allowed(_coerce_string(raw_filters.get("status")), {"soon", "inprogress", "completed"})
+    if status:
+        out["status"] = status
+
+    sentiment = _closest_from_allowed(_coerce_string(raw_filters.get("sentiment")), {"positive", "neutral", "negative", "mixed"})
+    if sentiment:
+        out["sentiment"] = sentiment
+
+    input_type = _closest_from_allowed(_coerce_string(raw_filters.get("input_type")), {"audio", "text", "reddit", "bluesky", "facebook"})
+    if input_type:
+        out["input_type"] = input_type
+
+    priority = _closest_from_allowed(_coerce_string(raw_filters.get("priority")), {"high", "medium", "low"})
+    if priority:
+        out["priority"] = priority
+
+    source_id = _resolve_lookup_value(raw_filters.get("source_id"), source_ids, source_name_to_id)
+    if not source_id:
+        source_id = _resolve_lookup_value(raw_filters.get("source"), source_ids, source_name_to_id)
+    if source_id:
+        out["source_id"] = source_id
+
+    department_id = _resolve_lookup_value(raw_filters.get("department_id"), department_ids, department_name_to_id)
+    if not department_id:
+        department_id = _resolve_lookup_value(raw_filters.get("department"), department_ids, department_name_to_id)
+    if department_id:
+        out["department_id"] = department_id
+
+    course_code = _coerce_string(raw_filters.get("course_code"))
+    if course_code:
+        out["course_code"] = course_code[:80]
+
+    search = _coerce_string(raw_filters.get("search"))
+    if search:
+        out["search"] = search[:200]
+
+    return out
 
 
 def redact_sensitive_text(text: str) -> str:
