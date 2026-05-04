@@ -25,7 +25,11 @@ from typing import Any
 logger = logging.getLogger("voxintent")
 
 # Reddit public JSON expects a real browser-style UA; matches a known-good pattern (search.json returns 200).
-DEFAULT_REDDIT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SentilyticsBot/1.0"
+DEFAULT_REDDIT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 
 # Cached Bluesky session (access JWT). Refreshed periodically when app-password auth is configured.
 _bsky_jwt_cache: tuple[str, float] | None = None
@@ -297,7 +301,7 @@ def collect_bluesky(
 def _reddit_headers() -> dict[str, str]:
     custom = (os.getenv("REDDIT_USER_AGENT") or "").strip()
     ua = custom if custom else DEFAULT_REDDIT_USER_AGENT
-    return {"User-Agent": ua}
+    return {"User-Agent": ua, "Accept": "application/json"}
 
 
 def collect_reddit_keyword_search_json(
@@ -602,12 +606,18 @@ def _probe_bluesky_live() -> bool:
 
 def _probe_reddit_public_live() -> bool:
     """True if anonymous Reddit search.json responds (same UA + URL shape as collect_reddit_keyword_search_json)."""
-    url = "https://www.reddit.com/search.json?q=test&limit=5"
-    try:
-        data = _http_get_json(url, headers=_reddit_headers())
-        return isinstance(data, dict) and isinstance((data.get("data") or {}).get("children"), list)
-    except Exception:
-        return False
+    urls = [
+        "https://www.reddit.com/search.json?q=test&limit=5",
+        "https://old.reddit.com/search.json?q=test&limit=5",
+    ]
+    for url in urls:
+        try:
+            data = _http_get_json(url, headers=_reddit_headers())
+            if isinstance(data, dict) and isinstance((data.get("data") or {}).get("children"), list):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _probe_reddit_oauth_live() -> bool:
